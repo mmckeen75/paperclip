@@ -35,6 +35,7 @@ vi.mock("../middleware/logger.js", () => ({
 
 import { logger } from "../middleware/logger.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
+import { environmentRuntimeService } from "../services/environment-runtime.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1573,5 +1574,69 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]?.status).toBe("expired");
     expect(rows[0]?.cleanupStatus).toBe("success");
+  });
+  it("releases an ephemeral SSH lease in pending_cleanup instead of failing every retry", async () => {
+    // A run on an SSH environment that is cancelled mid-flight (for example when
+    // its issue is reassigned) leaves an ephemeral SSH lease in pending_cleanup.
+    // The sweep tears ephemeral leases down through retryPendingSandboxTeardown.
+    // An SSH host has no provider resource to destroy, so the retry must release
+    // the lease rather than throw on every attempt and block the issue's wakes.
+    const companyId = randomUUID();
+    const environmentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: "SSH worker",
+      driver: "ssh",
+      status: "active",
+      config: { host: "worker.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace" },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    const leaseId = randomUUID();
+    const updatedAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      environmentId,
+      status: "pending_cleanup",
+      leasePolicy: "ephemeral",
+      provider: "ssh",
+      providerLeaseId: "ssh://agent@worker.example:22/home/agent/workspace",
+      cleanupStatus: "failed",
+      metadata: {
+        driver: "ssh",
+        host: "worker.example",
+        port: 22,
+        username: "agent",
+        remoteCwd: "/home/agent/workspace",
+      },
+      acquiredAt: updatedAt,
+      lastUsedAt: updatedAt,
+      releasedAt: updatedAt,
+      createdAt: updatedAt,
+      updatedAt,
+    });
+
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    const row = await db
+      .select({ status: environmentLeases.status, cleanupStatus: environmentLeases.cleanupStatus })
+      .from(environmentLeases)
+      .where(eq(environmentLeases.id, leaseId))
+      .then((rows) => rows[0]);
+    expect(row).toEqual({ status: "expired", cleanupStatus: "success" });
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ errorKind: "destroy_failed", leaseId }),
+      expect.anything(),
+    );
   });
 });

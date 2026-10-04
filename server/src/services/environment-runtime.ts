@@ -1219,6 +1219,16 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
       return await environmentsSvc.releaseLease(input.lease.id, input.status);
     },
 
+    // An SSH lease holds no provider-side resource: the host and its workspace
+    // outlive every run, so a pending_cleanup retry has nothing to tear down.
+    // Without this method the sweep's recorded-data teardown throws on every
+    // attempt for an ephemeral SSH lease, the lease never leaves
+    // pending_cleanup, and it blocks wakes on its issue. Returning no receipt
+    // lets the sweep release the lease.
+    async retryPendingSandboxTeardown() {
+      return null;
+    },
+
     async realizeWorkspace(input) {
       const record = buildWorkspaceRealizationRecordFromDriverInput({
         environment: input.environment,
