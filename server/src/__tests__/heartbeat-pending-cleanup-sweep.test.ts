@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { execFile, spawn } from "node:child_process";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -1651,7 +1656,11 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(mockRunSshCommand).not.toHaveBeenCalled();
   });
 
-  async function seedSshLeaseForCancelledRun() {
+  async function seedSshLeaseForCancelledRun(opts: {
+    environmentConfig?: Record<string, unknown>;
+    leaseMetadata?: Record<string, unknown>;
+    providerLeaseId?: string | null;
+  } = {}) {
     const companyId = randomUUID();
     const environmentId = randomUUID();
     const agentId = randomUUID();
@@ -1668,7 +1677,8 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       name: "SSH worker",
       driver: "ssh",
       status: "active",
-      config: { host: "worker.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace" },
+      config: opts.environmentConfig ??
+        { host: "worker.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace" },
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -1683,9 +1693,12 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       status: "pending_cleanup",
       leasePolicy: "ephemeral",
       provider: "ssh",
-      providerLeaseId: "ssh://agent@worker.example:22/home/agent/workspace",
+      providerLeaseId: opts.providerLeaseId === undefined
+        ? "ssh://agent@worker.example:22/home/agent/workspace"
+        : opts.providerLeaseId,
       cleanupStatus: "failed",
-      metadata: { driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace" },
+      metadata: opts.leaseMetadata ??
+        { driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace" },
       acquiredAt: updatedAt,
       lastUsedAt: updatedAt,
       releasedAt: updatedAt,
@@ -1739,5 +1752,110 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       expect.objectContaining({ errorKind: "destroy_failed", leaseId }),
       expect.anything(),
     );
+  });
+
+  async function expectStuckWithoutReceipt(companyId: string, runId: string, leaseId: string) {
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+  }
+
+  it("never certifies a run whose descendant cannot be read or stopped", async () => {
+    // The run has a readable, killable process, and that process has a child
+    // under another uid (for example a sudo helper): its environment is
+    // unreadable and the SSH user cannot signal it. The tree is followed
+    // through the parent pid, so the child counts as part of the run, and its
+    // survival must keep the lease in pending_cleanup with no receipt.
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
+    const runProcess = spawn("sleep", ["300"], { env: { ...process.env, PAPERCLIP_RUN_ID: runId }, stdio: "ignore" });
+    const fakeProc = await mkdtemp(join(tmpdir(), "paperclip-fake-proc-"));
+    try {
+      await symlink("/proc/self", join(fakeProc, "self"));
+      await writeFile(join(fakeProc, "mounts"), "");
+      await symlink(`/proc/${runProcess.pid}`, join(fakeProc, String(runProcess.pid)));
+      // An unreachable descendant: stat names the run process as its parent,
+      // its environment is unreadable, and no real process has its pid.
+      const helper = join(fakeProc, "999999");
+      await mkdir(helper);
+      const startTime = "4242";
+      await writeFile(join(helper, "stat"),
+        `999999 (sudo helper) S ${runProcess.pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ${startTime} 0 0\n`);
+      await writeFile(join(helper, "environ"), `PAPERCLIP_RUN_ID=${runId}\0`);
+      await chmod(join(helper, "environ"), 0o000);
+
+      mockRunSshCommand.mockImplementation(async (_config: unknown, script: string) => {
+        const local = script.replaceAll("/proc", fakeProc).replace(/^wait=10$/m, "wait=1");
+        await promisify(execFile)("sh", ["-c", local]);
+        return { stdout: "", stderr: "" };
+      });
+
+      const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+      const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+      expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({ swept: 1, destroyed: 0 });
+      await expectStuckWithoutReceipt(companyId, runId, leaseId);
+    } finally {
+      runProcess.kill("SIGKILL");
+      await chmod(join(fakeProc, "999999", "environ"), 0o600).catch(() => {});
+      await rm(fakeProc, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("checks the host recorded on the lease when the environment has been repointed", async () => {
+    // The run executed on worker.example. The environment now points at
+    // worker-new.example; finding nothing there would prove nothing.
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
+      environmentConfig: { host: "worker-new.example", port: 2222, username: "deploy", remoteWorkspacePath: "/srv/agent" },
+    });
+
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
+    expect(mockRunSshCommand.mock.calls[0]![0]).toMatchObject({
+      host: "worker.example", port: 22, username: "agent", strictHostKeyChecking: true,
+    });
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(true);
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row!.metadata?.remoteExecutionTermination).toMatchObject({ state: "stopped", runId });
+  });
+
+  it("keeps a repointed SSH lease when the recorded host is unreachable or its key cannot be verified", async () => {
+    const unreachable = await seedSshLeaseForCancelledRun({
+      environmentConfig: { host: "worker-new.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace" },
+    });
+    mockRunSshCommand.mockRejectedValueOnce(new Error("Host key verification failed."));
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(mockRunSshCommand.mock.calls[0]![0]).toMatchObject({ host: "worker.example" });
+    await expectStuckWithoutReceipt(unreachable.companyId, unreachable.runId, unreachable.leaseId);
+  });
+
+  it("does not trust a repointed environment when host key checking is off", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
+      environmentConfig: {
+        host: "worker-new.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace",
+        strictHostKeyChecking: false,
+      },
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(mockRunSshCommand).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ swept: 1, destroyed: 0 });
+    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+  });
+
+  it("keeps an SSH lease that records no host", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
+      leaseMetadata: { driver: "ssh" },
+      providerLeaseId: null,
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(mockRunSshCommand).not.toHaveBeenCalled();
+    await expectStuckWithoutReceipt(companyId, runId, leaseId);
   });
 });
