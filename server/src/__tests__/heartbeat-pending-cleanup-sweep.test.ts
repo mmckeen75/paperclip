@@ -1,9 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -80,7 +75,7 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     vi.mocked(logger.warn).mockClear();
     vi.mocked(logger.error).mockClear();
     mockRunSshCommand.mockReset();
-    mockRunSshCommand.mockResolvedValue({ stdout: "", stderr: "" });
+    mockRunSshCommand.mockResolvedValue({ stdout: "paperclip-run-sessions: stopped\n", stderr: "" });
   });
 
   afterEach(async () => {
@@ -1658,8 +1653,9 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
 
   async function seedSshLeaseForCancelledRun(opts: {
     environmentConfig?: Record<string, unknown>;
-    leaseMetadata?: Record<string, unknown>;
+    leaseMetadata?: (runId: string) => Record<string, unknown>;
     providerLeaseId?: string | null;
+    processStarted?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const environmentId = randomUUID();
@@ -1683,7 +1679,10 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       updatedAt: new Date(),
     });
     await db.insert(agents).values({ id: agentId, companyId, name: "SSH agent" });
-    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "cancelled" });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "cancelled",
+      processStartedAt: opts.processStarted === false ? null : new Date(Date.now() - 2 * 60 * 60 * 1000),
+    });
     const updatedAt = new Date(Date.now() - 60 * 60 * 1000);
     await db.insert(environmentLeases).values({
       id: leaseId,
@@ -1697,8 +1696,10 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
         ? "ssh://agent@worker.example:22/home/agent/workspace"
         : opts.providerLeaseId,
       cleanupStatus: "failed",
-      metadata: opts.leaseMetadata ??
-        { driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace" },
+      metadata: opts.leaseMetadata?.(runId) ?? {
+        driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace",
+        runSessionRecordDir: `.paperclip/run-sessions/${runId}`,
+      },
       acquiredAt: updatedAt,
       lastUsedAt: updatedAt,
       releasedAt: updatedAt,
@@ -1722,8 +1723,7 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
     const [config, script] = mockRunSshCommand.mock.calls[0]!;
     expect(config).toMatchObject({ host: "worker.example", port: 22, username: "agent" });
-    expect(script).toContain(`rid='${runId}'`);
-    expect(script).toContain("PAPERCLIP_RUN_ID=$rid");
+    expect(script).toContain(`.paperclip/run-sessions/${runId}`);
     const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
     expect(row!.metadata?.remoteExecutionTermination).toMatchObject({
@@ -1761,47 +1761,67 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
   }
 
-  it("never certifies a run whose descendant cannot be read or stopped", async () => {
-    // The run has a readable, killable process, and that process has a child
-    // under another uid (for example a sudo helper): its environment is
-    // unreadable and the SSH user cannot signal it. The tree is followed
-    // through the parent pid, so the child counts as part of the run, and its
-    // survival must keep the lease in pending_cleanup with no receipt.
+  it("releases a lease acquired before session tracking without a receipt", async () => {
+    // Such a lease records no session to stop, so nothing can confirm the run
+    // stopped: release it, and grant no continuation authority.
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
+      leaseMetadata: () =>
+        ({ driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace" }),
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(mockRunSshCommand).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+  });
+
+  it("releases without a receipt when the host could not record the session", async () => {
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
-    const runProcess = spawn("sleep", ["300"], { env: { ...process.env, PAPERCLIP_RUN_ID: runId }, stdio: "ignore" });
-    const fakeProc = await mkdtemp(join(tmpdir(), "paperclip-fake-proc-"));
-    try {
-      await symlink("/proc/self", join(fakeProc, "self"));
-      await writeFile(join(fakeProc, "mounts"), "");
-      await symlink(`/proc/${runProcess.pid}`, join(fakeProc, String(runProcess.pid)));
-      // An unreachable descendant: stat names the run process as its parent,
-      // its environment is unreadable, and no real process has its pid.
-      const helper = join(fakeProc, "999999");
-      await mkdir(helper);
-      const startTime = "4242";
-      await writeFile(join(helper, "stat"),
-        `999999 (sudo helper) S ${runProcess.pid} 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ${startTime} 0 0\n`);
-      await writeFile(join(helper, "environ"), `PAPERCLIP_RUN_ID=${runId}\0`);
-      await chmod(join(helper, "environ"), 0o000);
+    mockRunSshCommand.mockResolvedValueOnce({ stdout: "paperclip-run-sessions: untracked\n", stderr: "" });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
 
-      mockRunSshCommand.mockImplementation(async (_config: unknown, script: string) => {
-        const local = script.replaceAll("/proc", fakeProc).replace(/^wait=10$/m, "wait=1");
-        await promisify(execFile)("sh", ["-c", local]);
-        return { stdout: "", stderr: "" };
-      });
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+  });
 
-      const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
-      const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+  it("keeps a session-tracked lease whose run started but left no record", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
+    mockRunSshCommand.mockResolvedValueOnce({ stdout: "paperclip-run-sessions: no-record\n", stderr: "" });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
 
-      expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
-      expect(result).toMatchObject({ swept: 1, destroyed: 0 });
-      await expectStuckWithoutReceipt(companyId, runId, leaseId);
-    } finally {
-      runProcess.kill("SIGKILL");
-      await chmod(join(fakeProc, "999999", "environ"), 0o600).catch(() => {});
-      await rm(fakeProc, { recursive: true, force: true });
-    }
-  }, 20_000);
+    expect(result).toMatchObject({ swept: 1, destroyed: 0 });
+    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+  });
+
+  it("releases without a receipt when the run never started its process", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({ processStarted: false });
+    mockRunSshCommand.mockResolvedValueOnce({ stdout: "paperclip-run-sessions: no-record\n", stderr: "" });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+  });
+
+  it("keeps the lease when the stop returns no status", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
+    mockRunSshCommand.mockResolvedValueOnce({ stdout: "", stderr: "" });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+  });
 
   it("checks the host recorded on the lease when the environment has been repointed", async () => {
     // The run executed on worker.example. The environment now points at
@@ -1850,7 +1870,7 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
 
   it("keeps an SSH lease that records no host", async () => {
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
-      leaseMetadata: { driver: "ssh" },
+      leaseMetadata: (runId) => ({ driver: "ssh", runSessionRecordDir: `.paperclip/run-sessions/${runId}` }),
       providerLeaseId: null,
     });
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
