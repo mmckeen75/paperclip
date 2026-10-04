@@ -31,7 +31,7 @@ import type {
   PluginEnvironmentSyncResult,
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
-import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
+import { ensureSshWorkspaceReady, runSshCommand, shellQuote } from "@paperclipai/adapter-utils/ssh";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -1176,6 +1176,28 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   };
 }
 
+/**
+ * A POSIX shell script that stops every process of the SSH user whose
+ * environment carries `PAPERCLIP_RUN_ID=<runId>`, then confirms none remains.
+ * It reads `/proc/<pid>/environ`, so it needs a Linux host; elsewhere it exits
+ * non-zero, and the caller treats that as an unconfirmed stop. The run id is
+ * matched as an exact line, so no other run's processes can match.
+ */
+export function buildStopSshRunProcessesScript(runId: string): string {
+  return [
+    `rid=${shellQuote(runId)}`,
+    'run_pids() { for d in /proc/[0-9]*; do p=${d#/proc/}; [ "$p" = "$$" ] && continue; tr "\\000" "\\n" < "$d/environ" 2>/dev/null | grep -qxF "PAPERCLIP_RUN_ID=$rid" && printf "%s " "$p"; done; }',
+    '[ -r /proc/self/environ ] || { echo "cannot inspect processes: no /proc on this host" >&2; exit 2; }',
+    "pids=$(run_pids)",
+    '[ -z "$pids" ] && exit 0',
+    "kill -TERM $pids 2>/dev/null || true",
+    'i=0; while [ "$i" -lt 10 ]; do sleep 1; pids=$(run_pids); [ -z "$pids" ] && exit 0; i=$((i + 1)); done',
+    "kill -KILL $pids 2>/dev/null || true",
+    "sleep 1",
+    '[ -z "$(run_pids)" ] || { echo "processes of the run are still running" >&2; exit 3; }',
+  ].join("\n");
+}
+
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
   const environmentsSvc = environmentService(db);
 
@@ -1220,13 +1242,34 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     // An SSH lease holds no provider-side resource: the host and its workspace
-    // outlive every run, so a pending_cleanup retry has nothing to tear down.
+    // outlive every run, so a pending_cleanup retry has no sandbox to destroy.
     // Without this method the sweep's recorded-data teardown throws on every
     // attempt for an ephemeral SSH lease, the lease never leaves
-    // pending_cleanup, and it blocks wakes on its issue. Returning no receipt
-    // lets the sweep release the lease.
-    async retryPendingSandboxTeardown() {
-      return null;
+    // pending_cleanup, and it blocks wakes on its issue.
+    //
+    // What a retry must still establish is that the run's remote execution has
+    // ended, because continuation of a stopped run's queued messages requires a
+    // termination receipt (remoteExecutionHasStopped). The SSH adapters export
+    // PAPERCLIP_RUN_ID into the remote command's environment, and every process
+    // of the run inherits it. So the retry stops the SSH user's processes that
+    // carry this run id, confirms none remains, and only then returns a
+    // "stopped" receipt. Any failure throws, which keeps the lease in
+    // pending_cleanup for the next sweep.
+    async retryPendingSandboxTeardown(input) {
+      const runId = input.lease.heartbeatRunId;
+      // With no run there is no execution to confirm, and without the
+      // environment row there is no connection config to reach the host:
+      // release the lease, but grant no continuation authority.
+      if (!runId || !input.environment) return null;
+      const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, input.environment, {
+        issueId: input.lease.issueId,
+        heartbeatRunId: runId,
+      });
+      if (parsed.driver !== "ssh") {
+        throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
+      }
+      await runSshCommand(parsed.config, buildStopSshRunProcessesScript(runId), { timeoutMs: 60_000 });
+      return { providerLeaseId: input.lease.providerLeaseId, state: "stopped" };
     },
 
     async realizeWorkspace(input) {

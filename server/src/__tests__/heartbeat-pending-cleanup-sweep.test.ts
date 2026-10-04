@@ -33,9 +33,16 @@ vi.mock("../middleware/logger.js", () => ({
   httpLogger: vi.fn(),
 }));
 
+const mockRunSshCommand = vi.hoisted(() => vi.fn());
+vi.mock("@paperclipai/adapter-utils/ssh", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@paperclipai/adapter-utils/ssh")>()),
+  runSshCommand: mockRunSshCommand,
+}));
+
 import { logger } from "../middleware/logger.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
+import { remoteExecutionHasStopped } from "../services/remote-execution-termination.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -67,6 +74,8 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
   beforeEach(() => {
     vi.mocked(logger.warn).mockClear();
     vi.mocked(logger.error).mockClear();
+    mockRunSshCommand.mockReset();
+    mockRunSshCommand.mockResolvedValue({ stdout: "", stderr: "" });
   });
 
   afterEach(async () => {
@@ -1635,6 +1644,98 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
       .then((rows) => rows[0]);
     expect(row).toEqual({ status: "expired", cleanupStatus: "success" });
     expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ errorKind: "destroy_failed", leaseId }),
+      expect.anything(),
+    );
+    // No run is attached, so there is no remote execution to confirm.
+    expect(mockRunSshCommand).not.toHaveBeenCalled();
+  });
+
+  async function seedSshLeaseForCancelledRun() {
+    const companyId = randomUUID();
+    const environmentId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const leaseId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `S${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: "SSH worker",
+      driver: "ssh",
+      status: "active",
+      config: { host: "worker.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace" },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({ id: agentId, companyId, name: "SSH agent" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "cancelled" });
+    const updatedAt = new Date(Date.now() - 60 * 60 * 1000);
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      environmentId,
+      heartbeatRunId: runId,
+      status: "pending_cleanup",
+      leasePolicy: "ephemeral",
+      provider: "ssh",
+      providerLeaseId: "ssh://agent@worker.example:22/home/agent/workspace",
+      cleanupStatus: "failed",
+      metadata: { driver: "ssh", host: "worker.example", port: 22, username: "agent", remoteCwd: "/home/agent/workspace" },
+      acquiredAt: updatedAt,
+      lastUsedAt: updatedAt,
+      releasedAt: updatedAt,
+      createdAt: updatedAt,
+      updatedAt,
+    });
+    return { companyId, runId, leaseId };
+  }
+
+  it("confirms a cancelled run's SSH processes stopped and records a receipt, so its queued messages can continue", async () => {
+    // A stopped run's queued messages continue only once every lease of the run
+    // carries a remote termination receipt (remoteExecutionHasStopped). Releasing
+    // the SSH lease without one would leave those messages blocked.
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
+    const [config, script] = mockRunSshCommand.mock.calls[0]!;
+    expect(config).toMatchObject({ host: "worker.example", port: 22, username: "agent" });
+    expect(script).toContain(`rid='${runId}'`);
+    expect(script).toContain("PAPERCLIP_RUN_ID=$rid");
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(row!.metadata?.remoteExecutionTermination).toMatchObject({
+      state: "stopped",
+      runId,
+      leaseId,
+      provider: "ssh",
+      providerLeaseId: "ssh://agent@worker.example:22/home/agent/workspace",
+    });
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(true);
+  });
+
+  it("keeps an SSH lease in pending_cleanup when the run's processes cannot be confirmed stopped", async () => {
+    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
+    mockRunSshCommand.mockRejectedValueOnce(new Error("processes of the run are still running"));
+
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+
+    expect(result).toMatchObject({ swept: 1, destroyed: 0 });
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+    expect(logger.warn).toHaveBeenCalledWith(
       expect.objectContaining({ errorKind: "destroy_failed", leaseId }),
       expect.anything(),
     );
