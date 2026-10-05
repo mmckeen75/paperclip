@@ -1655,7 +1655,6 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     environmentConfig?: Record<string, unknown>;
     leaseMetadata?: (runId: string) => Record<string, unknown>;
     providerLeaseId?: string | null;
-    processStarted?: boolean;
   } = {}) {
     const companyId = randomUUID();
     const environmentId = randomUUID();
@@ -1681,7 +1680,8 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     await db.insert(agents).values({ id: agentId, companyId, name: "SSH agent" });
     await db.insert(heartbeatRuns).values({
       id: runId, companyId, agentId, status: "cancelled",
-      processStartedAt: opts.processStarted === false ? null : new Date(Date.now() - 2 * 60 * 60 * 1000),
+      // The run's (local ssh client) process started.
+      processStartedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
     });
     const updatedAt = new Date(Date.now() - 60 * 60 * 1000);
     await db.insert(environmentLeases).values({
@@ -1754,6 +1754,13 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     );
   });
 
+  async function expectReleasedWithoutReceipt(companyId: string, runId: string, leaseId: string) {
+    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+  }
+
   async function expectStuckWithoutReceipt(companyId: string, runId: string, leaseId: string) {
     const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
     expect(row).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
@@ -1792,35 +1799,29 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
   });
 
-  it("keeps a session-tracked lease whose run started but left no record", async () => {
+  it("releases without a receipt when the run's session record is missing", async () => {
+    // A missing record never appears on a later attempt: the record may have
+    // been removed by an earlier attempt whose release failed, or the run's
+    // spawn may never have reached the host. Throwing would keep the lease in
+    // pending_cleanup forever. The run's process did start (processStartedAt
+    // is set), which says nothing about the host.
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
     mockRunSshCommand.mockResolvedValueOnce({ stdout: "paperclip-run-sessions: no-record\n", stderr: "" });
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
     const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
 
-    expect(result).toMatchObject({ swept: 1, destroyed: 0 });
-    await expectStuckWithoutReceipt(companyId, runId, leaseId);
-  });
-
-  it("releases without a receipt when the run never started its process", async () => {
-    const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({ processStarted: false });
-    mockRunSshCommand.mockResolvedValueOnce({ stdout: "paperclip-run-sessions: no-record\n", stderr: "" });
-    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
-    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
-
+    expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ swept: 1, destroyed: 1 });
-    const [row] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
-    expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
-    expect(row!.metadata?.remoteExecutionTermination).toBeUndefined();
-    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(false);
+    await expectReleasedWithoutReceipt(companyId, runId, leaseId);
   });
 
-  it("keeps the lease when the stop returns no status", async () => {
+  it("releases without a receipt when the stop returns no status", async () => {
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun();
     mockRunSshCommand.mockResolvedValueOnce({ stdout: "", stderr: "" });
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
-    await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
-    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    await expectReleasedWithoutReceipt(companyId, runId, leaseId);
   });
 
   it("checks the host recorded on the lease when the environment has been repointed", async () => {
@@ -1854,7 +1855,9 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     await expectStuckWithoutReceipt(unreachable.companyId, unreachable.runId, unreachable.leaseId);
   });
 
-  it("does not trust a repointed environment when host key checking is off", async () => {
+  it("releases a repointed lease without a receipt when host key checking is off", async () => {
+    // Nothing would prove the connection reached the recorded host, and no
+    // later attempt can change that.
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
       environmentConfig: {
         host: "worker-new.example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace",
@@ -1864,18 +1867,31 @@ describeEmbeddedPostgres("heartbeat sweepPendingCleanupLeases", () => {
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
     const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(mockRunSshCommand).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ swept: 1, destroyed: 0 });
-    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    await expectReleasedWithoutReceipt(companyId, runId, leaseId);
   });
 
-  it("keeps an SSH lease that records no host", async () => {
+  it("does not treat a host name differing only in case as a repoint", async () => {
+    const { companyId, runId } = await seedSshLeaseForCancelledRun({
+      environmentConfig: {
+        host: "Worker.Example", port: 22, username: "agent", remoteWorkspacePath: "/home/agent/workspace",
+        strictHostKeyChecking: false,
+      },
+    });
+    const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
+    const result = await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
+    expect(mockRunSshCommand).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({ swept: 1, destroyed: 1 });
+    expect(await remoteExecutionHasStopped(db, companyId, runId)).toBe(true);
+  });
+
+  it("releases an SSH lease that records no host without a receipt", async () => {
     const { companyId, runId, leaseId } = await seedSshLeaseForCancelledRun({
       leaseMetadata: (runId) => ({ driver: "ssh", runSessionRecordDir: `.paperclip/run-sessions/${runId}` }),
-      providerLeaseId: null,
     });
     const heartbeat = heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) });
     await heartbeat.sweepPendingCleanupLeases({ backoffMs: 0 });
     expect(mockRunSshCommand).not.toHaveBeenCalled();
-    await expectStuckWithoutReceipt(companyId, runId, leaseId);
+    await expectReleasedWithoutReceipt(companyId, runId, leaseId);
   });
 });

@@ -1256,6 +1256,10 @@ export async function runSshCommand(
   }
 }
 
+// Run session records live under the SSH user's home directory, not under the
+// workspace (`<remoteDir>/.paperclip-runtime`): the cleanup of a stuck lease
+// can run after the environment's workspace path has been repointed or the
+// workspace cleaned, and the record must still be where the run left it.
 const SSH_RUN_SESSION_RECORD_ROOT = ".paperclip/run-sessions";
 
 /**
@@ -1272,23 +1276,30 @@ export function sshRunSessionRecordDir(runId: string): string | null {
   return /^[A-Za-z0-9-]{1,128}$/.test(runId) ? `${SSH_RUN_SESSION_RECORD_ROOT}/${runId}` : null;
 }
 
+/**
+ * Removes run session record dirs untouched for 30 days. A record outlives a
+ * run that ended normally, because the spawn `exec`s the agent command and
+ * nothing runs after it. Silent and always succeeds.
+ */
+export function buildPruneSshRunSessionRecordsScript(): string {
+  return `{ find "$HOME"/${shellQuote(SSH_RUN_SESSION_RECORD_ROOT)} -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + ; } >/dev/null 2>&1 || true`;
+}
+
 // Records the session this spawn runs in as `<sid> <leader start time>` in
 // `<record dir>/<sid>`, before the command is exec'd. The session id is taken
 // from /proc only when it is this shell or its parent (the login shell sshd
 // started), so a host that did not start a new session never records a foreign
 // one; such a host, or one without /proc, writes an `untracked` marker instead.
-// Recording is best effort and never blocks the run. Record dirs untouched for
-// 30 days are pruned.
+// Recording is best effort and never blocks the run. Stat files are read with
+// the `read` builtin, which forks nothing.
 function buildRecordSshRunSessionScript(recordDir: string): string {
   return [
     "{",
-    `pc_root="$HOME"/${shellQuote(SSH_RUN_SESSION_RECORD_ROOT)};`,
     `pc_d="$HOME"/${shellQuote(recordDir)};`,
-    'find "$pc_root" -mindepth 1 -maxdepth 1 -type d -mtime +30 -exec rm -rf {} + ;',
     'mkdir -p "$pc_d" &&',
-    'if pc_s=$(cat "/proc/$$/stat") && pc_r=${pc_s##*")"} && set -- $pc_r && pc_sid=$4 &&',
+    'if read -r pc_s < "/proc/$$/stat" && pc_r=${pc_s##*")"} && set -- $pc_r && pc_sid=$4 &&',
     '{ [ "$pc_sid" = "$$" ] || [ "$pc_sid" = "$PPID" ]; } &&',
-    'pc_s=$(cat "/proc/$pc_sid/stat") && pc_r=${pc_s##*")"} && set -- $pc_r && [ -n "${20}" ];',
+    'read -r pc_s < "/proc/$pc_sid/stat" && pc_r=${pc_s##*")"} && set -- $pc_r && [ -n "${20}" ];',
     'then printf \'%s %s\\n\' "$pc_sid" "${20}" > "$pc_d/$pc_sid.tmp" && mv -f "$pc_d/$pc_sid.tmp" "$pc_d/$pc_sid";',
     'else : > "$pc_d/untracked"; fi;',
     "} >/dev/null 2>&1 || true",
@@ -1307,55 +1318,67 @@ export function parseSshRunSessionStopStatus(stdout: string): SshRunSessionStopS
 }
 
 /**
- * Stops every process in the sessions recorded for an SSH run
- * (sshRunSessionRecordDir) and confirms none remain.
+ * Stops an SSH run's processes on the host and reports whether that is
+ * confirmed.
  *
- * - Members are the processes whose session id (field 6 of `/proc/<pid>/stat`,
- *   readable for every uid) is a recorded id. That includes descendants that
- *   were re-parented, and descendants under another uid.
- * - A recorded id whose pid now belongs to a process with a different start
- *   time was reused, which Linux allows only once the session is empty, so that
- *   session is done. Members must also have started no earlier than the
- *   recorded session leader.
- * - TERM, then KILL after `wait` seconds. Anything still running at the end,
- *   including a member this user cannot signal, makes the script exit 3.
- * - A process that called `setsid()` itself has left the session and is not
- *   found. That is a known limitation.
+ * The processes to stop are the union of two sets:
+ * - **The recorded sessions' members** (sshRunSessionRecordDir): processes
+ *   whose session id, from `/proc/<pid>/stat` (readable for every uid), is a
+ *   recorded id. That includes re-parented descendants and descendants under
+ *   another uid. A recorded id whose pid now belongs to a process with a
+ *   different start time was reused, which Linux allows only once the session
+ *   is empty, so that session is done. Members must also have started no
+ *   earlier than the recorded session leader.
+ * - **The SSH user's processes whose environment holds the exact line
+ *   `PAPERCLIP_RUN_ID=<runId>`.** This catches a process that left the
+ *   session with `setsid()` but kept its environment. The scan only adds
+ *   processes to stop; an environment it cannot read is skipped, so it never
+ *   proves anything stopped. A process that both calls `setsid()` and clears
+ *   its environment is not found.
  *
- * The script prints one status line and exits 0 when it can conclude:
- * `stopped` (the sessions are empty; the record is removed), `untracked` (the
- * host could not record the session, so nothing can be confirmed) or
- * `no-record`. It exits non-zero, with a reason on stderr, when the record is
- * unreadable (5), when `/proc` is missing or mounted with `hidepid` (2), or
- * when members survive (3).
+ * Both sets get TERM, then KILL after `wait` seconds, and are re-derived on
+ * every check. A zombie counts as stopped. Anything still running at the end,
+ * including a member this user cannot signal, makes the script exit 3, the
+ * only failure a later attempt can resolve.
+ *
+ * Otherwise the script exits 0 with one status line:
+ * - `stopped`: records were read and every set is empty. The record is removed.
+ * - `untracked`: nothing can confirm the run stopped. The host wrote an
+ *   `untracked` marker, a record is unreadable or malformed, `/proc` is
+ *   missing, or `/proc` is mounted with `hidepid`, which hides other uids'
+ *   session members.
+ * - `no-record`: there is no record for the run.
  */
 export function buildStopSshRunSessionsScript(runId: string): string {
   const recordDir = sshRunSessionRecordDir(runId);
   if (!recordDir) throw new Error(`Invalid run id for an SSH session record: ${runId}`);
   return [
     `d="$HOME"/${shellQuote(recordDir)}`,
+    `rid=${shellQuote(runId)}`,
     "wait=10",
-    "status() { echo \"paperclip-run-sessions: $1\"; }",
-    "[ -d \"$d\" ] || { status no-record; exit 0; }",
-    "recs=''; untracked=0",
-    "for f in \"$d\"/*; do",
-    "  [ -e \"$f\" ] || continue",
-    "  n=${f##*/}",
-    "  case \"$n\" in untracked) untracked=1; continue ;; *.tmp) continue ;; esac",
-    "  line=$(cat \"$f\") || { echo \"cannot read session record $n\" >&2; exit 5; }",
-    "  set -- $line",
-    "  case \"$1\" in ''|*[!0-9]*) echo \"malformed session record $n\" >&2; exit 5 ;; esac",
-    "  case \"$2\" in ''|*[!0-9]*) echo \"malformed session record $n\" >&2; exit 5 ;; esac",
-    "  [ \"$1\" = \"$n\" ] || { echo \"malformed session record $n\" >&2; exit 5; }",
-    "  recs=\"$recs $1:$2\"",
-    "done",
-    "if [ -z \"$recs\" ]; then",
-    "  if [ \"$untracked\" = 1 ]; then status untracked; else status no-record; fi",
-    "  exit 0",
+    "me=$$",
+    "recs=''; untracked=0; norecord=0",
+    "if [ -d \"$d\" ]; then",
+    "  for f in \"$d\"/*; do",
+    "    [ -e \"$f\" ] || continue",
+    "    n=${f##*/}",
+    "    case \"$n\" in untracked) untracked=1; continue ;; *.tmp) continue ;; esac",
+    "    line=''",
+    "    { read -r line < \"$f\"; } 2>/dev/null || [ -n \"$line\" ] || { echo \"cannot read session record $n\" >&2; untracked=1; continue; }",
+    "    set -- $line",
+    "    case \"$1:$2\" in *[!0-9:]*|:*|*:) echo \"malformed session record $n\" >&2; untracked=1; continue ;; esac",
+    "    [ \"$1\" = \"$n\" ] || { echo \"malformed session record $n\" >&2; untracked=1; continue; }",
+    "    recs=\"$recs $1:$2\"",
+    "  done",
+    "  [ -z \"$recs\" ] && [ \"$untracked\" = 0 ] && norecord=1",
+    "else",
+    "  norecord=1",
     "fi",
-    "[ -r /proc/self/stat ] || { echo \"cannot inspect processes: no /proc on this host\" >&2; exit 2; }",
-    "grep -qE '^proc /proc proc .*hidepid=(1|2|invisible|noaccess)' /proc/mounts 2>/dev/null && { echo \"cannot inspect processes: /proc is mounted with hidepid\" >&2; exit 2; }",
-    "members() { for p in /proc/[0-9]*; do s=$(cat \"$p/stat\" 2>/dev/null) || continue; r=${s##*\")\"}; set -- $r; echo \"${p#/proc/} $1 $4 ${20}\"; done | awk -v recs=\"$recs\" 'BEGIN { n = split(recs, a, \" \"); for (i = 1; i <= n; i++) { split(a[i], kv, \":\"); st[kv[1]] = kv[2] } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; if (($1 in st) && $4 != st[$1]) reused[$1] = 1 } END { for (i = 1; i <= NR; i++) { s = sid[i]; if ((s in st) && !(s in reused) && state[i] != \"Z\" && state[i] != \"X\" && start[i] + 0 >= st[s] + 0) print pid[i] } }'; }",
+    "status() { if [ \"$norecord\" = 1 ]; then s=no-record; elif [ \"$untracked\" = 1 ]; then s=untracked; else s=stopped; fi; echo \"paperclip-run-sessions: $s\"; }",
+    "[ -r /proc/self/stat ] || { echo \"cannot inspect processes: no /proc on this host\" >&2; [ \"$norecord\" = 1 ] || untracked=1; status; exit 0; }",
+    "grep -qE '^proc /proc proc .*hidepid=(1|2|4|invisible|noaccess|ptraceable)' /proc/mounts 2>/dev/null && { echo \"cannot see other users' processes: /proc is mounted with hidepid\" >&2; [ \"$norecord\" = 1 ] || untracked=1; }",
+    "snap() { for p in /proc/[0-9]*; do { read -r s < \"$p/stat\"; } 2>/dev/null || continue; r=${s##*\")\"}; set -- $r; e=0; if [ \"${p#/proc/}\" != \"$me\" ] && [ -O \"$p/environ\" ] && [ -r \"$p/environ\" ] && tr '\\000' '\\n' < \"$p/environ\" 2>/dev/null | grep -qxF \"PAPERCLIP_RUN_ID=$rid\"; then e=1; fi; echo \"${p#/proc/} $1 $4 ${20} $e\"; done; }",
+    "members() { snap | awk -v recs=\"$recs\" 'BEGIN { n = split(recs, a, \" \"); for (i = 1; i <= n; i++) { split(a[i], kv, \":\"); st[kv[1]] = kv[2] } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; env[NR] = $5; if (($1 in st) && $4 != st[$1]) reused[$1] = 1 } END { for (i = 1; i <= NR; i++) { if (state[i] == \"Z\" || state[i] == \"X\") continue; s = sid[i]; if (((s in st) && !(s in reused) && start[i] + 0 >= st[s] + 0) || env[i] == 1) print pid[i] } }'; }",
     "m=$(members)",
     "if [ -n \"$m\" ]; then",
     "  kill -TERM $m 2>/dev/null",
@@ -1364,7 +1387,7 @@ export function buildStopSshRunSessionsScript(runId: string): string {
     "  [ -z \"$m\" ] || { echo \"processes of the run are still running or could not be signalled: $(echo $m)\" >&2; exit 3; }",
     "fi",
     "rm -rf \"$d\"",
-    "if [ \"$untracked\" = 1 ]; then status untracked; else status stopped; fi",
+    "status",
   ].join("\n");
 }
 
@@ -1373,6 +1396,9 @@ export async function buildSshSpawnTarget(input: {
   command: string;
   args: string[];
   env: Record<string, string>;
+  // The heartbeat run this spawn belongs to. Its remote session is recorded
+  // under this id. When absent, the env's PAPERCLIP_RUN_ID is used.
+  runId?: string | null;
 }): Promise<{
   command: string;
   args: string[];
@@ -1389,7 +1415,7 @@ export async function buildSshSpawnTarget(input: {
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
-  const runId = input.env.PAPERCLIP_RUN_ID;
+  const runId = input.runId ?? input.env.PAPERCLIP_RUN_ID;
   const recordDir = typeof runId === "string" ? sshRunSessionRecordDir(runId) : null;
   // Source the login profiles first, then run `env KEY=VAL cmd` so
   // user-supplied identity overrides win over anything a profile re-exports.
@@ -1814,9 +1840,12 @@ export async function restoreWorkspaceFromSshExecution(input: {
 export async function ensureSshWorkspaceReady(
   config: SshConnectionConfig,
 ): Promise<{ remoteCwd: string }> {
+  // Each lease acquire also prunes stale run session records, so they don't
+  // accumulate on a long-lived host.
   const result = await runSshCommand(
     config,
-    `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
+    `${buildPruneSshRunSessionRecordsScript()}; ` +
+      `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
   );
   return {
     remoteCwd: result.stdout.trim(),

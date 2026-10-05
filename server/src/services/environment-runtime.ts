@@ -1184,25 +1184,17 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
 /**
  * The SSH identity a lease was acquired against: the host, port and user
- * recorded in its metadata, or else parsed from its `ssh://user@host:port/path`
- * provider lease id. Null when neither records a usable identity.
+ * recorded in its metadata. Null when the metadata records no usable identity.
+ * Every SSH lease acquire has recorded these fields, and only a lease acquired
+ * with session tracking reaches this, so the metadata is the one source.
  */
-export function recordedSshLeaseIdentity(lease: Pick<EnvironmentLease, "metadata" | "providerLeaseId">):
+export function recordedSshLeaseIdentity(lease: Pick<EnvironmentLease, "metadata">):
   { host: string; port: number; username: string } | null {
   const metadata = (lease.metadata ?? {}) as Record<string, unknown>;
   const host = typeof metadata.host === "string" ? metadata.host.trim() : "";
   const port = typeof metadata.port === "number" ? metadata.port : Number(metadata.port);
   const username = typeof metadata.username === "string" ? metadata.username.trim() : "";
-  if (host && username && Number.isInteger(port) && port > 0) return { host, port, username };
-  if (typeof lease.providerLeaseId !== "string") return null;
-  try {
-    const url = new URL(lease.providerLeaseId);
-    const parsedPort = url.port ? Number(url.port) : 22;
-    if (url.protocol !== "ssh:" || !url.hostname || !url.username || !Number.isInteger(parsedPort)) return null;
-    return { host: url.hostname, port: parsedPort, username: decodeURIComponent(url.username) };
-  } catch {
-    return null;
-  }
+  return host && username && Number.isInteger(port) && port > 0 ? { host, port, username } : null;
 }
 
 function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
@@ -1266,64 +1258,50 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     // the remote session its spawn recorded (buildSshSpawnTarget). The retry
     // stops that session on the host recorded on the lease, confirms it is
     // empty (buildStopSshRunSessionsScript), and only then returns a "stopped"
-    // receipt. A failure that a later attempt can resolve throws, which keeps
-    // the lease in pending_cleanup for the next sweep.
+    // receipt.
+    //
+    // The retry throws, keeping the lease in pending_cleanup, only when a later
+    // attempt could succeed: the host could not be reached, or processes
+    // survived the kill. Whenever nothing can be confirmed otherwise, it
+    // returns null: the lease is released without a receipt, which grants no
+    // continuation authority and so is always safe.
     async retryPendingSandboxTeardown(input) {
       const runId = input.lease.heartbeatRunId;
       // With no run there is no execution to confirm, and without the
-      // environment row there is no connection config to reach the host:
-      // release the lease, but grant no continuation authority.
+      // environment row there is no connection config to reach the host.
       if (!runId || !input.environment) return null;
-      // A lease acquired before session tracking has no record to stop the run
-      // from: release it, again without a receipt.
+      // `runSessionRecordDir` marks a lease acquired with session tracking. It
+      // is compared against the dir recomputed from the run id, never used as
+      // a path, so lease metadata cannot point the stop anywhere else. A lease
+      // acquired before session tracking has no record to stop the run from.
       const recordDir = sshRunSessionRecordDir(runId);
       if (!recordDir || input.lease.metadata?.runSessionRecordDir !== recordDir) return null;
       // The run executed on the host recorded on the lease. The environment may
       // have been repointed since, so connect to the recorded host, never the
       // current one: finding nothing on a different host proves nothing.
       const recorded = recordedSshLeaseIdentity(input.lease);
-      if (!recorded) {
-        throw new Error("The SSH lease records no host, so the run's processes cannot be checked.");
-      }
+      if (!recorded) return null;
       const parsed = await resolveEnvironmentDriverConfigForRuntime(db, input.lease.companyId, input.environment, {
         issueId: input.lease.issueId,
         heartbeatRunId: runId,
       });
-      if (parsed.driver !== "ssh") {
-        throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
-      }
-      const repointed = parsed.config.host !== recorded.host ||
+      if (parsed.driver !== "ssh") return null;
+      // Host names are case-insensitive.
+      const repointed = parsed.config.host.toLowerCase() !== recorded.host.toLowerCase() ||
         parsed.config.port !== recorded.port || parsed.config.username !== recorded.username;
       // A repointed environment's credentials are reused for the recorded host
       // only when ssh verifies that host's key; with host key checking off,
       // nothing would prove the connection reached the recorded host.
-      if (repointed && !parsed.config.strictHostKeyChecking) {
-        throw new Error(
-          "The SSH environment now points at a different host and host key checking is off, " +
-          "so the lease's recorded host cannot be verified.",
-        );
-      }
+      if (repointed && !parsed.config.strictHostKeyChecking) return null;
+      // Throws when the host can't be reached or processes survive.
       const { stdout } = await runSshCommand(
         { ...parsed.config, host: recorded.host, port: recorded.port, username: recorded.username },
         buildStopSshRunSessionsScript(runId),
         { timeoutMs: 60_000 },
       );
-      const status = parseSshRunSessionStopStatus(stdout);
-      if (status === "stopped") return { providerLeaseId: input.lease.providerLeaseId, state: "stopped" };
-      // The host could not record the session (no /proc, or sshd started no
-      // new session), so nothing can confirm the run stopped. Retrying cannot
-      // change that: release the lease without a receipt.
-      if (status === "untracked") return null;
-      if (status === "no-record") {
-        // A run that never started its process has nothing on the host.
-        const [run] = await db
-          .select({ processStartedAt: heartbeatRuns.processStartedAt })
-          .from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, runId));
-        if (!run?.processStartedAt) return null;
-        throw new Error("The run's remote session record is missing, so its processes cannot be checked.");
-      }
-      throw new Error("Stopping the run's remote session returned no status.");
+      return parseSshRunSessionStopStatus(stdout) === "stopped"
+        ? { providerLeaseId: input.lease.providerLeaseId, state: "stopped" }
+        : null;
     },
 
     async realizeWorkspace(input) {

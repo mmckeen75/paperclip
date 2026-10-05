@@ -1,14 +1,22 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  buildPruneSshRunSessionRecordsScript,
+  buildSshEnvLabFixtureConfig,
   buildSshSpawnTarget,
   buildStopSshRunSessionsScript,
+  ensureSshWorkspaceReady,
+  getSshEnvLabSupport,
   parseSshRunSessionStopStatus,
+  runSshCommand,
   sshRunSessionRecordDir,
+  startSshEnvLabFixture,
+  stopSshEnvLabFixture,
+  type SshEnvLabFixtureState,
 } from "./ssh.js";
 
 const spec = {
@@ -23,6 +31,7 @@ const spec = {
 };
 
 const RUN_ID = "4f17d9d6-a124-4432-9040-a93d53d1e9f2";
+const OTHER_RUN_ID = "0b6f9a51-5d0e-4f3e-9d43-2f0c8f1e7a10";
 
 // The stop script waits 10 s between TERM and KILL; the tests wait 1 s.
 function stopScript(runId: string, procRoot = "/proc") {
@@ -60,6 +69,11 @@ async function until(check: () => Promise<boolean> | boolean, timeoutMs = 5_000)
   }
 }
 
+async function readPids(file: string, count: number) {
+  await until(async () => (await readFile(file, "utf8").catch(() => "")).trim().split(/\s+/).filter(Boolean).length >= count);
+  return (await readFile(file, "utf8")).trim().split(/\s+/).map(Number);
+}
+
 describe("SSH run session tracking", () => {
   it("records the session before exec when the spawn carries a run id", async () => {
     const target = await buildSshSpawnTarget({
@@ -74,6 +88,19 @@ describe("SSH run session tracking", () => {
     expect(record).toBeLessThan(remoteScript.indexOf("exec env "));
     expect(remoteScript).toContain("/proc/$$/stat");
     await target.cleanup();
+  });
+
+  it("records the session under the explicit run id, without PAPERCLIP_RUN_ID in the env", async () => {
+    const target = await buildSshSpawnTarget({ spec, command: "node", args: [], env: { FOO: "bar" }, runId: RUN_ID });
+    expect(String(target.args.at(-1) ?? "")).toContain(`.paperclip/run-sessions/${RUN_ID}`);
+    await target.cleanup();
+    const both = await buildSshSpawnTarget({
+      spec, command: "node", args: [], env: { PAPERCLIP_RUN_ID: OTHER_RUN_ID }, runId: RUN_ID,
+    });
+    const script = String(both.args.at(-1) ?? "");
+    expect(script).toContain(`.paperclip/run-sessions/${RUN_ID}`);
+    expect(script).not.toContain(`.paperclip/run-sessions/${OTHER_RUN_ID}`);
+    await both.cleanup();
   });
 
   it("records nothing without a run id, or for a run id unsafe in a path", async () => {
@@ -93,6 +120,25 @@ describe("SSH run session tracking", () => {
     expect(parseSshRunSessionStopStatus("paperclip-run-sessions: no-record")).toBe("no-record");
     expect(parseSshRunSessionStopStatus("paperclip-run-sessions: stoppedx\n")).toBeNull();
     expect(parseSshRunSessionStopStatus("")).toBeNull();
+  });
+
+  it("prunes record dirs untouched for 30 days and keeps fresh ones", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-prune-"));
+    try {
+      const root = path.join(home, ".paperclip/run-sessions");
+      await mkdir(path.join(root, "stale"), { recursive: true });
+      await mkdir(path.join(root, "fresh"), { recursive: true });
+      const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+      await utimes(path.join(root, "stale"), old, old);
+      const result = await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: home });
+      expect(result.code).toBe(0);
+      expect(existsSync(path.join(root, "stale"))).toBe(false);
+      expect(existsSync(path.join(root, "fresh"))).toBe(true);
+      // No record root at all is not an error.
+      expect((await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: path.join(home, "none") })).code).toBe(0);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -138,39 +184,53 @@ describeLinux("SSH run session stop (real processes)", () => {
     return child;
   }
 
-  async function readPids(file: string, count: number) {
-    await until(async () => (await readFile(file, "utf8").catch(() => "")).trim().split(/\s+/).length >= count);
-    return (await readFile(file, "utf8")).trim().split(/\s+/).map(Number);
-  }
-
-  it("stops every process in the recorded session, including a re-parented orphan and a TERM-ignoring member", async () => {
+  it("stops the recorded session's members and the run's setsid escapes, and nothing else", async () => {
     await makeHome();
     const pidFile = path.join(home, "pids");
+    const escapeFile = path.join(home, "escape");
+    const clearedFile = path.join(home, "cleared");
     // An orphan whose parent exits at once (re-parented away from the run),
-    // a child, and a shell that ignores TERM and so needs KILL.
-    const child = await spawnAsSshd("sh", ["-c",
-      `(sleep 301 & echo $! >> ${pidFile}); sleep 302 & echo $! >> ${pidFile}; trap '' TERM; echo $$ >> ${pidFile}; wait`]);
-    // A process of the same user in a separate session is not the run's.
-    const outsider = spawn("sleep", ["303"], { detached: true, stdio: "ignore" });
-    children.push(outsider);
+    // a child, a process that leaves the session with setsid but keeps the
+    // run's environment, one that leaves with setsid and clears its
+    // environment (the documented limitation), and a shell that ignores
+    // TERM and so needs KILL.
+    const child = await spawnAsSshd("sh", ["-c", [
+      `(sleep 301 & echo $! >> ${pidFile})`,
+      `sleep 302 & echo $! >> ${pidFile}`,
+      `setsid sh -c 'echo $$ >> ${escapeFile}; exec sleep 303' &`,
+      `setsid env -i /bin/sh -c 'echo $$ >> ${clearedFile}; exec /bin/sleep 304' &`,
+      `trap '' TERM; echo $$ >> ${pidFile}; wait`,
+    ].join("\n")]);
+    // Same user, other sessions: one with no run id, one with another run's id.
+    const outsider = spawn("sleep", ["305"], { detached: true, stdio: "ignore" });
+    const otherRun = spawn("sleep", ["306"], {
+      detached: true, stdio: "ignore", env: { ...process.env, PAPERCLIP_RUN_ID: OTHER_RUN_ID },
+    });
+    children.push(outsider, otherRun);
     const [orphan, sleeper, shell] = await readPids(pidFile, 3);
-    pids.push(orphan!, sleeper!);
+    const [escaped] = await readPids(escapeFile, 1);
+    const [cleared] = await readPids(clearedFile, 1);
+    pids.push(orphan!, sleeper!, escaped!, cleared!);
     const recordFile = path.join(home, ".paperclip/run-sessions", RUN_ID, String(child.pid));
     await until(() => existsSync(recordFile));
     const [sid, leaderStart] = (await readFile(recordFile, "utf8")).trim().split(" ");
     expect(Number(sid)).toBe(child.pid);
     expect(Number(leaderStart)).toBeGreaterThan(0);
     // The orphan was re-parented away from the run's processes, and still
-    // shares the run's session.
+    // shares the run's session. The setsid processes left it.
     await until(() => ![String(shell), String(child.pid)].includes(statFields(orphan!)[1]!));
     expect(statFields(orphan!)[3]).toBe(String(child.pid));
+    await until(() => statFields(escaped!)[3] === String(escaped));
+    await until(() => statFields(cleared!)[3] === String(cleared));
 
     const result = await runSh(stopScript(RUN_ID), { PATH: process.env.PATH, HOME: home });
 
     expect(result).toMatchObject({ code: 0 });
     expect(parseSshRunSessionStopStatus(result.stdout)).toBe("stopped");
-    for (const pid of [orphan!, sleeper!, shell!]) expect(isRunning(pid)).toBe(false);
+    for (const pid of [orphan!, sleeper!, shell!, escaped!]) expect(isRunning(pid)).toBe(false);
+    expect(isRunning(cleared!)).toBe(true);
     expect(isRunning(outsider.pid!)).toBe(true);
+    expect(isRunning(otherRun.pid!)).toBe(true);
     expect(existsSync(path.join(home, ".paperclip/run-sessions", RUN_ID))).toBe(false);
   }, 20_000);
 
@@ -178,7 +238,7 @@ describeLinux("SSH run session stop (real processes)", () => {
     await makeHome();
     // A live session leader whose start time differs from the record: the
     // recorded session ended and its id was reused, so nothing is signalled.
-    const reuser = spawn("sleep", ["304"], { detached: true, stdio: "ignore" });
+    const reuser = spawn("sleep", ["307"], { detached: true, stdio: "ignore" });
     children.push(reuser);
     const dir = path.join(home, ".paperclip/run-sessions", RUN_ID);
     await mkdir(dir, { recursive: true });
@@ -190,26 +250,59 @@ describeLinux("SSH run session stop (real processes)", () => {
     expect(isRunning(reuser.pid!)).toBe(true);
   });
 
-  it("reports no record, an untracked host, and fails on an unreadable or malformed record", async () => {
+  it("reports no-record or untracked, never a failure, when nothing can be confirmed", async () => {
     await makeHome();
     const env = { PATH: process.env.PATH, HOME: home };
-    expect(parseSshRunSessionStopStatus((await runSh(stopScript(RUN_ID), env)).stdout)).toBe("no-record");
+    const statusOf = async (script = stopScript(RUN_ID)) => {
+      const result = await runSh(script, env);
+      expect(result.code).toBe(0);
+      return parseSshRunSessionStopStatus(result.stdout);
+    };
+    expect(await statusOf()).toBe("no-record");
 
     const dir = path.join(home, ".paperclip/run-sessions", RUN_ID);
     await mkdir(dir, { recursive: true });
-    expect(parseSshRunSessionStopStatus((await runSh(stopScript(RUN_ID), env)).stdout)).toBe("no-record");
+    expect(await statusOf()).toBe("no-record");
 
+    // The stop removes the empty record dir it found.
+    await mkdir(dir, { recursive: true });
     await writeFile(path.join(dir, "untracked"), "");
-    expect(parseSshRunSessionStopStatus((await runSh(stopScript(RUN_ID), env)).stdout)).toBe("untracked");
-
+    expect(await statusOf()).toBe("untracked");
+    await mkdir(dir, { recursive: true });
     await writeFile(path.join(dir, "123"), "123 not-a-number\n");
-    expect(await runSh(stopScript(RUN_ID), env)).toMatchObject({ code: 5, stdout: "" });
+    expect(await statusOf()).toBe("untracked");
+    await rm(dir, { recursive: true, force: true });
 
-    await rm(path.join(dir, "123"));
     if (process.getuid?.() !== 0) {
+      await mkdir(dir, { recursive: true });
       await writeFile(path.join(dir, "unreadable"), "1 1\n");
       await chmod(path.join(dir, "unreadable"), 0o000);
-      expect(await runSh(stopScript(RUN_ID), env)).toMatchObject({ code: 5, stdout: "" });
+      expect(await statusOf()).toBe("untracked");
+      await chmod(path.join(dir, "unreadable"), 0o600).catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    }
+
+    // A host without /proc: a record cannot be checked.
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, "999998"), "999998 4000\n");
+    expect(await statusOf(stopScript(RUN_ID, path.join(home, "no-proc")))).toBe("untracked");
+  });
+
+  it("reports untracked when /proc is mounted with hidepid, including hidepid=ptraceable", async () => {
+    for (const mode of ["2", "invisible", "ptraceable"]) {
+      await makeHome();
+      const fakeProc = await mkdtemp(path.join(home, "proc-"));
+      await symlink("/proc/self", path.join(fakeProc, "self"));
+      await writeFile(path.join(fakeProc, "mounts"), `proc ${fakeProc} proc rw,nosuid,hidepid=${mode} 0 0\n`);
+      const dir = path.join(home, ".paperclip/run-sessions", RUN_ID);
+      await mkdir(dir, { recursive: true });
+      await writeFile(path.join(dir, "999998"), "999998 4000\n");
+
+      const result = await runSh(stopScript(RUN_ID, fakeProc), { PATH: process.env.PATH, HOME: home });
+
+      expect(result.code).toBe(0);
+      expect(parseSshRunSessionStopStatus(result.stdout)).toBe("untracked");
+      await rm(home, { recursive: true, force: true });
     }
   });
 
@@ -238,4 +331,73 @@ describeLinux("SSH run session stop (real processes)", () => {
     expect(parseSshRunSessionStopStatus(result.stdout)).toBeNull();
     expect(existsSync(dir)).toBe(true);
   }, 20_000);
+});
+
+// End to end through a real sshd, when the host has one: the run is spawned
+// over ssh, cancelled by killing the local ssh client (all a cancel does
+// today), and then stopped by the cleanup script over a second connection.
+const sshSupport = await getSshEnvLabSupport();
+const describeSshd = sshSupport.supported && existsSync("/proc/self/stat") ? describe : describe.skip;
+
+describeSshd("SSH run session stop through sshd", () => {
+  let rootDir: string | null = null;
+  let state: SshEnvLabFixtureState | null = null;
+
+  afterEach(async () => {
+    if (state) await stopSshEnvLabFixture(state).catch(() => undefined);
+    if (rootDir) await rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
+    state = null;
+    rootDir = null;
+  });
+
+  it("stops a cancelled run's remote processes, which outlive the local ssh client", async () => {
+    rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-session-e2e-"));
+    state = await startSshEnvLabFixture({ statePath: path.join(rootDir, "state.json") });
+    const config = await buildSshEnvLabFixtureConfig(state);
+    // sshd uses the account's home directory, which may differ from $HOME here.
+    const remoteHome = (await runSshCommand(config, "printf %s \"$HOME\"")).stdout.trim();
+    const recordRoot = path.join(remoteHome, ".paperclip/run-sessions");
+    // A stale record dir, which the lease acquire prunes.
+    const stale = path.join(recordRoot, `stale-${process.pid}`);
+    await mkdir(stale, { recursive: true });
+    const old = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    await utimes(stale, old, old);
+    const { remoteCwd } = await ensureSshWorkspaceReady(config);
+    expect(existsSync(stale)).toBe(false);
+
+    const runId = `e2e-${process.pid}-${Date.now()}`;
+    const pidFile = path.join(rootDir, "remote-pids");
+    const target = await buildSshSpawnTarget({
+      spec: { ...config, remoteCwd },
+      command: "sh",
+      args: ["-c", `sleep 311 & echo $! >> ${pidFile}; setsid sh -c 'echo $$ >> ${pidFile}; exec sleep 312' & sleep 0.2; echo $$ >> ${pidFile}; wait`],
+      env: { PAPERCLIP_RUN_ID: runId },
+      runId,
+    });
+    const client = spawn("ssh", target.args, { stdio: "ignore" });
+    try {
+      const [sleeper, escaped, shell] = await readPids(pidFile, 3);
+      await until(() => existsSync(path.join(recordRoot, runId)));
+      client.kill("SIGKILL");
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Killing the local client is all a cancel does today; the remote run
+      // keeps going.
+      for (const pid of [sleeper!, escaped!, shell!]) expect(isRunning(pid)).toBe(true);
+
+      const result = await runSshCommand(config, buildStopSshRunSessionsScript(runId).replace(/^wait=10$/m, "wait=1"), {
+        timeoutMs: 30_000,
+      });
+
+      expect(parseSshRunSessionStopStatus(result.stdout)).toBe("stopped");
+      for (const pid of [sleeper!, escaped!, shell!]) expect(isRunning(pid)).toBe(false);
+      expect(existsSync(path.join(recordRoot, runId))).toBe(false);
+    } finally {
+      client.kill("SIGKILL");
+      for (const pid of await readFile(pidFile, "utf8").then((text) => text.trim().split(/\s+/).map(Number)).catch(() => [])) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* gone */ }
+      }
+      await target.cleanup();
+      await rm(path.join(recordRoot, runId), { recursive: true, force: true });
+    }
+  }, 60_000);
 });
