@@ -444,6 +444,149 @@ describeLinux("SSH run session stop (real processes)", () => {
     }
   });
 
+  describe("pruning old record dirs", () => {
+    const oldTime = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+    const recordRoot = () => path.join(home, ".paperclip/run-sessions");
+
+    // A record dir holding the given files, aged `old` or left fresh.
+    async function recordDir(name: string, files: Record<string, string>, old = true) {
+      const dir = path.join(recordRoot(), name);
+      await mkdir(dir, { recursive: true });
+      for (const [file, content] of Object.entries(files)) await writeFile(path.join(dir, file), content);
+      if (old) await utimes(dir, oldTime, oldTime);
+      return dir;
+    }
+
+    // A session that has ended: its leader was started, killed and reaped.
+    async function deadSession() {
+      const leader = spawn("sleep", ["320"], { detached: true, stdio: "ignore" });
+      await until(() => isRunning(leader.pid!));
+      const record = `${leader.pid} ${startTimeOf(leader.pid!)}\n`;
+      const exited = new Promise((resolve) => leader.on("exit", resolve));
+      leader.kill("SIGKILL");
+      await exited;
+      return { sid: leader.pid!, record };
+    }
+
+    async function pathWithout(tool: string) {
+      const bin = path.join(home, `bin-without-${tool}`);
+      await mkdir(bin);
+      for (const name of ["sh", "awk", "tr", "grep", "sleep", "rm", "find"].filter((name) => name !== tool)) {
+        const resolved = await new Promise<string>((resolve) =>
+          execFile("sh", ["-c", `command -v ${name}`], (_error, stdout) => resolve(stdout.trim())));
+        await symlink(resolved, path.join(bin, name));
+      }
+      return bin;
+    }
+
+    it("keeps an old dir while its session is alive, and prunes it once the session has ended", async () => {
+      await makeHome();
+      // A live session leader (spawned detached, so in its own session).
+      const leader = spawn("sleep", ["321"], { detached: true, stdio: "ignore" });
+      children.push(leader);
+      await until(() => isRunning(leader.pid!));
+      // A session whose leader has exited but whose member still runs.
+      const pidFile = path.join(home, "member");
+      const orphaned = spawn("sh", ["-c", `sleep 322 & echo $! > ${pidFile}`], { detached: true, stdio: "ignore" });
+      const [member] = await readPids(pidFile, 1);
+      pids.push(member!);
+      await until(() => !isRunning(orphaned.pid!));
+      expect(statFields(member!)[3]).toBe(String(orphaned.pid));
+      // The leader is gone, so its start time can't be read any more; the
+      // spawn would have recorded one no later than the member's.
+      const orphanedStart = startTimeOf(member!);
+      const dead = await deadSession();
+      // A recorded sid whose pid now belongs to another process: ended.
+      const reuser = spawn("sleep", ["323"], { detached: true, stdio: "ignore" });
+      children.push(reuser);
+      await until(() => isRunning(reuser.pid!));
+
+      const liveDir = await recordDir("live", { [String(leader.pid)]: `${leader.pid} ${startTimeOf(leader.pid!)}\n` });
+      const memberDir = await recordDir("member", { [String(orphaned.pid)]: `${orphaned.pid} ${orphanedStart}\n` });
+      const deadDir = await recordDir("dead", { [String(dead.sid)]: dead.record });
+      const reusedDir = await recordDir("reused", { [String(reuser.pid)]: `${reuser.pid} 1\n` });
+      const youngDir = await recordDir("young", { [String(dead.sid)]: dead.record }, false);
+
+      const result = await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: home });
+
+      expect(result.code).toBe(0);
+      expect(existsSync(liveDir)).toBe(true);
+      expect(existsSync(memberDir)).toBe(true);
+      expect(existsSync(deadDir)).toBe(false);
+      expect(existsSync(reusedDir)).toBe(false);
+      expect(existsSync(youngDir)).toBe(true);
+      // The prune signals nothing.
+      expect(isRunning(leader.pid!)).toBe(true);
+      expect(isRunning(member!)).toBe(true);
+    });
+
+    it("prunes an old dir whose session ended when no recorded session is alive", async () => {
+      await makeHome();
+      const dead = await deadSession();
+      const deadDir = await recordDir("dead", { [String(dead.sid)]: dead.record });
+
+      const result = await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: home });
+
+      expect(result.code).toBe(0);
+      expect(existsSync(deadDir)).toBe(false);
+    });
+
+    it("keeps an old dir with an unreadable or malformed record", async () => {
+      await makeHome();
+      const malformed = await recordDir("malformed", { "123": "123 not-a-number\n" });
+      const misnamed = await recordDir("misnamed", { "123": "456 789\n" });
+
+      await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: home });
+
+      expect(existsSync(malformed)).toBe(true);
+      expect(existsSync(misnamed)).toBe(true);
+    });
+
+    it("prunes nothing with a session record when awk is missing, but still prunes untracked-only dirs by age", async () => {
+      await makeHome();
+      const dead = await deadSession();
+      const deadDir = await recordDir("dead", { [String(dead.sid)]: dead.record });
+      const untrackedDir = await recordDir("untracked-only", { untracked: "" });
+      const emptyDir = await recordDir("empty", {});
+      const youngUntracked = await recordDir("young-untracked", { untracked: "" }, false);
+
+      await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: await pathWithout("awk"), HOME: home });
+
+      expect(existsSync(deadDir)).toBe(true);
+      expect(existsSync(untrackedDir)).toBe(false);
+      expect(existsSync(emptyDir)).toBe(false);
+      expect(existsSync(youngUntracked)).toBe(true);
+    });
+
+    it("prunes nothing with a session record when the scan cannot see pid 1", async () => {
+      await makeHome();
+      const dead = await deadSession();
+      const deadDir = await recordDir("dead", { [String(dead.sid)]: dead.record });
+      const fakeProc = await mkdtemp(path.join(home, "proc-"));
+      await symlink("/proc/self", path.join(fakeProc, "self"));
+      await writeFile(path.join(fakeProc, "mounts"), "");
+
+      const script = buildPruneSshRunSessionRecordsScript().replaceAll("/proc", fakeProc);
+      await runInFakeProc(script, fakeProc, { PATH: process.env.PATH, HOME: home }, false);
+
+      expect(existsSync(deadDir)).toBe(true);
+    });
+
+    it("prunes nothing with a session record when /proc is mounted with hidepid", async () => {
+      await makeHome();
+      const dead = await deadSession();
+      const deadDir = await recordDir("dead", { [String(dead.sid)]: dead.record });
+      const fakeProc = await mkdtemp(path.join(home, "proc-"));
+      await symlink("/proc/self", path.join(fakeProc, "self"));
+      await writeFile(path.join(fakeProc, "mounts"), `none ${fakeProc} proc rw,hidepid=invisible 0 0\n`);
+
+      const script = buildPruneSshRunSessionRecordsScript().replaceAll("/proc", fakeProc);
+      await runInFakeProc(script, fakeProc, { PATH: process.env.PATH, HOME: home });
+
+      expect(existsSync(deadDir)).toBe(true);
+    });
+  });
+
   it("never targets its own processes when its environment carries the run id", async () => {
     await makeHome();
     const member = await recordLiveSession();
