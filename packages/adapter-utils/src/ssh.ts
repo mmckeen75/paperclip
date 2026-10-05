@@ -1345,9 +1345,14 @@ export function parseSshRunSessionStopStatus(stdout: string): SshRunSessionStopS
  * - `stopped`: records were read and every set is empty. The record is removed.
  * - `untracked`: nothing can confirm the run stopped. The host wrote an
  *   `untracked` marker, a record is unreadable or malformed, `/proc` is
- *   missing, or `/proc` is mounted with `hidepid`, which hides other uids'
- *   session members.
+ *   missing or mounted with `hidepid`, `awk`/`tr`/`grep`/`sleep` is missing,
+ *   or a scan did not provably complete and see every process (its own shell
+ *   and pid 1).
  * - `no-record`: there is no record for the run.
+ *
+ * `stopped` is printed only after a scan that provably ran and could see
+ * other users' processes found nothing left. Processes in the stop's own
+ * session are never targets.
  */
 export function buildStopSshRunSessionsScript(runId: string): string {
   const recordDir = sshRunSessionRecordDir(runId);
@@ -1375,15 +1380,29 @@ export function buildStopSshRunSessionsScript(runId: string): string {
     "  norecord=1",
     "fi",
     "status() { if [ \"$norecord\" = 1 ]; then s=no-record; elif [ \"$untracked\" = 1 ]; then s=untracked; else s=stopped; fi; echo \"paperclip-run-sessions: $s\"; }",
-    "[ -r /proc/self/stat ] || { echo \"cannot inspect processes: no /proc on this host\" >&2; [ \"$norecord\" = 1 ] || untracked=1; status; exit 0; }",
-    "grep -qE '^proc /proc proc .*hidepid=(1|2|4|invisible|noaccess|ptraceable)' /proc/mounts 2>/dev/null && { echo \"cannot see other users' processes: /proc is mounted with hidepid\" >&2; [ \"$norecord\" = 1 ] || untracked=1; }",
-    "snap() { for p in /proc/[0-9]*; do { read -r s < \"$p/stat\"; } 2>/dev/null || continue; r=${s##*\")\"}; set -- $r; e=0; if [ \"${p#/proc/}\" != \"$me\" ] && [ -O \"$p/environ\" ] && [ -r \"$p/environ\" ] && tr '\\000' '\\n' < \"$p/environ\" 2>/dev/null | grep -qxF \"PAPERCLIP_RUN_ID=$rid\"; then e=1; fi; echo \"${p#/proc/} $1 $4 ${20} $e\"; done; }",
-    "members() { snap | awk -v recs=\"$recs\" 'BEGIN { n = split(recs, a, \" \"); for (i = 1; i <= n; i++) { split(a[i], kv, \":\"); st[kv[1]] = kv[2] } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; env[NR] = $5; if (($1 in st) && $4 != st[$1]) reused[$1] = 1 } END { for (i = 1; i <= NR; i++) { if (state[i] == \"Z\" || state[i] == \"X\") continue; s = sid[i]; if (((s in st) && !(s in reused) && start[i] + 0 >= st[s] + 0) || env[i] == 1) print pid[i] } }'; }",
-    "m=$(members)",
+    // Anything that stops the scan from seeing every process ends in
+    // `untracked` (no receipt), never in `stopped`.
+    "unconfirmed() { echo \"cannot confirm the run stopped: $1\" >&2; [ \"$norecord\" = 1 ] || untracked=1; status; exit 0; }",
+    "[ -r /proc/self/stat ] || unconfirmed \"no /proc on this host\"",
+    "for t in awk tr grep sleep; do command -v \"$t\" >/dev/null 2>&1 || unconfirmed \"$t is not installed\"; done",
+    "grep -qE '^[^ ]+ /proc proc .*hidepid=(1|2|4|invisible|noaccess|ptraceable)' /proc/mounts 2>/dev/null && { echo \"cannot see other users' processes: /proc is mounted with hidepid\" >&2; [ \"$norecord\" = 1 ] || untracked=1; }",
+    // The stop's own session (its subshells, awk, tr, grep) is never a
+    // target, even if this shell's environment carries the run id.
+    "unset PAPERCLIP_RUN_ID",
+    "mysid=''; { read -r s < \"/proc/$me/stat\"; } 2>/dev/null && { r=${s##*\")\"}; set -- $r; mysid=$4; }",
+    "[ -n \"$mysid\" ] || unconfirmed \"cannot read this shell's own /proc entry\"",
+    "snap() { for p in /proc/[0-9]*; do { read -r s < \"$p/stat\"; } 2>/dev/null || continue; r=${s##*\")\"}; set -- $r; e=0; if [ \"$4\" != \"$mysid\" ] && [ -O \"$p/environ\" ] && [ -r \"$p/environ\" ] && tr '\\000' '\\n' < \"$p/environ\" 2>/dev/null | grep -qxF \"PAPERCLIP_RUN_ID=$rid\"; then e=1; fi; echo \"${p#/proc/} $1 $4 ${20} $e\"; done; }",
+    // The scan counts only if awk ran to completion (the scan-ok line) and the
+    // snapshot holds both this shell (enumeration works) and pid 1, which
+    // every pid namespace has and which hidepid or a security policy hides
+    // from an unprivileged user.
+    "scan() { snap | awk -v recs=\"$recs\" -v me=\"$me\" -v mysid=\"$mysid\" 'BEGIN { n = split(recs, a, \" \"); for (i = 1; i <= n; i++) { split(a[i], kv, \":\"); st[kv[1]] = kv[2] } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; env[NR] = $5; if ($1 == me) seenme = 1; if ($1 == \"1\") seeninit = 1; if (($1 in st) && $4 != st[$1]) reused[$1] = 1 } END { for (i = 1; i <= NR; i++) { if (sid[i] == mysid || state[i] == \"Z\" || state[i] == \"X\") continue; s = sid[i]; if (((s in st) && !(s in reused) && start[i] + 0 >= st[s] + 0) || env[i] == 1) print pid[i] } print \"scan-ok\", seenme + 0, seeninit + 0 }'; }",
+    "members() { out=$(scan); case \"$out\" in *'scan-ok 1 1') ;; *) unconfirmed \"the process scan did not complete or could not see every process\" ;; esac; m=$(printf '%s\\n' \"$out\" | grep -v '^scan-ok'); }",
+    "members",
     "if [ -n \"$m\" ]; then",
     "  kill -TERM $m 2>/dev/null",
-    "  i=0; while [ \"$i\" -lt \"$wait\" ]; do sleep 1; m=$(members); [ -z \"$m\" ] && break; i=$((i + 1)); done",
-    "  k=0; while [ -n \"$m\" ] && [ \"$k\" -lt 3 ]; do kill -KILL $m 2>/dev/null; sleep 1; m=$(members); k=$((k + 1)); done",
+    "  i=0; while [ \"$i\" -lt \"$wait\" ]; do sleep 1; members; [ -z \"$m\" ] && break; i=$((i + 1)); done",
+    "  k=0; while [ -n \"$m\" ] && [ \"$k\" -lt 3 ]; do kill -KILL $m 2>/dev/null; sleep 1; members; k=$((k + 1)); done",
     "  [ -z \"$m\" ] || { echo \"processes of the run are still running or could not be signalled: $(echo $m)\" >&2; exit 3; }",
     "fi",
     "rm -rf \"$d\"",

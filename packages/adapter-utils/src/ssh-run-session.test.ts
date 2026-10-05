@@ -13,6 +13,7 @@ import {
   getSshEnvLabSupport,
   parseSshRunSessionStopStatus,
   runSshCommand,
+  shellQuote,
   sshRunSessionRecordDir,
   startSshEnvLabFixture,
   stopSshEnvLabFixture,
@@ -38,12 +39,16 @@ function stopScript(runId: string, procRoot = "/proc") {
   return buildStopSshRunSessionsScript(runId).replace(/^wait=10$/m, "wait=1").replaceAll("/proc", procRoot);
 }
 
+// Runs a script in a new session, as sshd runs the stop.
 function runSh(script: string, env: NodeJS.ProcessEnv): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    execFile("sh", ["-c", script], { env }, (error, stdout, stderr) => {
-      const code = error ? (typeof error.code === "number" ? error.code : 1) : 0;
-      resolve({ code, stdout, stderr });
-    });
+  return new Promise((resolve, reject) => {
+    const child = spawn("sh", ["-c", script], { env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
   });
 }
 
@@ -67,6 +72,19 @@ async function until(check: () => Promise<boolean> | boolean, timeoutMs = 5_000)
     if (Date.now() > deadline) throw new Error("timed out");
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
+}
+
+// Runs the stop against a fake /proc that holds the stopping shell's own entry
+// (linked in before the script starts, under the same pid) and, unless
+// `withInit` is false, pid 1.
+async function runInFakeProc(script: string, fakeProc: string, env: NodeJS.ProcessEnv, withInit = true) {
+  if (withInit) await symlink("/proc/1", path.join(fakeProc, "1"));
+  return runSh(`ln -s /proc/$$ ${fakeProc}/$$ && exec sh -c ${shellQuote(script)}`, env);
+}
+
+// The session start time of a live pid, as the spawn records it.
+function startTimeOf(pid: number) {
+  return statFields(pid)[19]!;
 }
 
 async function readPids(file: string, count: number) {
@@ -189,28 +207,36 @@ describeLinux("SSH run session stop (real processes)", () => {
     const pidFile = path.join(home, "pids");
     const escapeFile = path.join(home, "escape");
     const clearedFile = path.join(home, "cleared");
+    const stubbornFile = path.join(home, "stubborn");
     // An orphan whose parent exits at once (re-parented away from the run),
     // a child, a process that leaves the session with setsid but keeps the
     // run's environment, one that leaves with setsid and clears its
-    // environment (the documented limitation), and a shell that ignores
-    // TERM and so needs KILL.
+    // environment (the documented limitation), a setsid escape that ignores
+    // TERM (so the run-id set must reach the KILL pass), and a shell that
+    // ignores TERM and so needs KILL.
     const child = await spawnAsSshd("sh", ["-c", [
       `(sleep 301 & echo $! >> ${pidFile})`,
       `sleep 302 & echo $! >> ${pidFile}`,
       `setsid sh -c 'echo $$ >> ${escapeFile}; exec sleep 303' &`,
       `setsid env -i /bin/sh -c 'echo $$ >> ${clearedFile}; exec /bin/sleep 304' &`,
+      `setsid sh -c 'trap "" TERM; echo $$ >> ${stubbornFile}; exec sleep 308' &`,
       `trap '' TERM; echo $$ >> ${pidFile}; wait`,
     ].join("\n")]);
-    // Same user, other sessions: one with no run id, one with another run's id.
+    // Same user, other sessions: one with no run id, one with another run's
+    // id, and one whose run id has this run's id as a prefix.
     const outsider = spawn("sleep", ["305"], { detached: true, stdio: "ignore" });
     const otherRun = spawn("sleep", ["306"], {
       detached: true, stdio: "ignore", env: { ...process.env, PAPERCLIP_RUN_ID: OTHER_RUN_ID },
     });
-    children.push(outsider, otherRun);
+    const prefixRun = spawn("sleep", ["309"], {
+      detached: true, stdio: "ignore", env: { ...process.env, PAPERCLIP_RUN_ID: `${RUN_ID}0` },
+    });
+    children.push(outsider, otherRun, prefixRun);
     const [orphan, sleeper, shell] = await readPids(pidFile, 3);
     const [escaped] = await readPids(escapeFile, 1);
     const [cleared] = await readPids(clearedFile, 1);
-    pids.push(orphan!, sleeper!, escaped!, cleared!);
+    const [stubborn] = await readPids(stubbornFile, 1);
+    pids.push(orphan!, sleeper!, escaped!, cleared!, stubborn!);
     const recordFile = path.join(home, ".paperclip/run-sessions", RUN_ID, String(child.pid));
     await until(() => existsSync(recordFile));
     const [sid, leaderStart] = (await readFile(recordFile, "utf8")).trim().split(" ");
@@ -227,10 +253,11 @@ describeLinux("SSH run session stop (real processes)", () => {
 
     expect(result).toMatchObject({ code: 0 });
     expect(parseSshRunSessionStopStatus(result.stdout)).toBe("stopped");
-    for (const pid of [orphan!, sleeper!, shell!, escaped!]) expect(isRunning(pid)).toBe(false);
+    for (const pid of [orphan!, sleeper!, shell!, escaped!, stubborn!]) expect(isRunning(pid)).toBe(false);
     expect(isRunning(cleared!)).toBe(true);
     expect(isRunning(outsider.pid!)).toBe(true);
     expect(isRunning(otherRun.pid!)).toBe(true);
+    expect(isRunning(prefixRun.pid!)).toBe(true);
     expect(existsSync(path.join(home, ".paperclip/run-sessions", RUN_ID))).toBe(false);
   }, 20_000);
 
@@ -324,12 +351,108 @@ describeLinux("SSH run session stop (real processes)", () => {
     await mkdir(dir, { recursive: true });
     await writeFile(path.join(dir, "999998"), "999998 4000\n");
 
-    const result = await runSh(stopScript(RUN_ID, fakeProc), { PATH: process.env.PATH, HOME: home });
+    const result = await runInFakeProc(stopScript(RUN_ID, fakeProc), fakeProc, { PATH: process.env.PATH, HOME: home });
 
     expect(result.code).toBe(3);
     expect(result.stderr).toContain("999999");
     expect(parseSshRunSessionStopStatus(result.stdout)).toBeNull();
     expect(existsSync(dir)).toBe(true);
+  }, 20_000);
+
+  // A recorded session with a live member, for the fail-closed cases below.
+  async function recordLiveSession() {
+    const member = spawn("sleep", ["310"], { detached: true, stdio: "ignore" });
+    children.push(member);
+    await until(() => isRunning(member.pid!));
+    const dir = path.join(home, ".paperclip/run-sessions", RUN_ID);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, String(member.pid)), `${member.pid} ${startTimeOf(member.pid!)}\n`);
+    return member;
+  }
+
+  it("reports untracked, not stopped, when awk is missing", async () => {
+    await makeHome();
+    const member = await recordLiveSession();
+    // A PATH with every tool the stop uses except awk.
+    const bin = path.join(home, "bin");
+    await mkdir(bin);
+    for (const tool of ["sh", "tr", "grep", "sleep", "rm"]) {
+      const resolved = await new Promise<string>((resolve) =>
+        execFile("sh", ["-c", `command -v ${tool}`], (_error, stdout) => resolve(stdout.trim())));
+      await symlink(resolved, path.join(bin, tool));
+    }
+
+    const result = await runSh(stopScript(RUN_ID), { PATH: bin, HOME: home });
+
+    expect(result.code).toBe(0);
+    expect(parseSshRunSessionStopStatus(result.stdout)).toBe("untracked");
+    expect(isRunning(member.pid!)).toBe(true);
+  });
+
+  it("reports untracked, not stopped, when the scan cannot see pid 1 (hidepid or a security policy)", async () => {
+    await makeHome();
+    // The live member is hidden from the scan, as another user's process is
+    // under hidepid=2 with a mount line the regex doesn't match, or under an
+    // SELinux/AppArmor policy. Only the scan's own entry is visible.
+    const member = await recordLiveSession();
+    const fakeProc = await mkdtemp(path.join(home, "proc-"));
+    await symlink("/proc/self", path.join(fakeProc, "self"));
+    await writeFile(path.join(fakeProc, "mounts"), "");
+
+    const result = await runInFakeProc(stopScript(RUN_ID, fakeProc), fakeProc, { PATH: process.env.PATH, HOME: home }, false);
+
+    expect(result.code).toBe(0);
+    expect(parseSshRunSessionStopStatus(result.stdout)).toBe("untracked");
+    expect(isRunning(member.pid!)).toBe(true);
+  });
+
+  it("reports untracked, not stopped, when the scan cannot read its own /proc entry", async () => {
+    await makeHome();
+    const member = await recordLiveSession();
+    const fakeProc = await mkdtemp(path.join(home, "proc-"));
+    await symlink("/proc/self", path.join(fakeProc, "self"));
+    await writeFile(path.join(fakeProc, "mounts"), "");
+    await symlink("/proc/1", path.join(fakeProc, "1"));
+
+    // Run without linking the shell's own entry in.
+    const result = await runSh(stopScript(RUN_ID, fakeProc), { PATH: process.env.PATH, HOME: home });
+
+    expect(result.code).toBe(0);
+    expect(parseSshRunSessionStopStatus(result.stdout)).toBe("untracked");
+    expect(isRunning(member.pid!)).toBe(true);
+  });
+
+  it("reports untracked, not stopped, when /proc cannot be enumerated", async () => {
+    await makeHome();
+    const member = await recordLiveSession();
+    const fakeProc = await mkdtemp(path.join(home, "proc-"));
+    await symlink("/proc/self", path.join(fakeProc, "self"));
+    await writeFile(path.join(fakeProc, "mounts"), "");
+    // Entries resolve by name, but the directory can't be listed, so the
+    // scan's glob finds nothing: an empty snapshot must not read as "stopped".
+    const script = stopScript(RUN_ID, fakeProc);
+    await symlink("/proc/1", path.join(fakeProc, "1"));
+    await chmod(fakeProc, 0o311);
+    try {
+      const result = await runSh(`ln -s /proc/$$ ${fakeProc}/$$ && exec sh -c ${shellQuote(script)}`,
+        { PATH: process.env.PATH, HOME: home });
+      expect(result.code).toBe(0);
+      expect(parseSshRunSessionStopStatus(result.stdout)).toBe("untracked");
+      expect(isRunning(member.pid!)).toBe(true);
+    } finally {
+      await chmod(fakeProc, 0o755);
+    }
+  });
+
+  it("never targets its own processes when its environment carries the run id", async () => {
+    await makeHome();
+    const member = await recordLiveSession();
+
+    const result = await runSh(stopScript(RUN_ID), { PATH: process.env.PATH, HOME: home, PAPERCLIP_RUN_ID: RUN_ID });
+
+    expect(result).toMatchObject({ code: 0 });
+    expect(parseSshRunSessionStopStatus(result.stdout)).toBe("stopped");
+    expect(isRunning(member.pid!)).toBe(false);
   }, 20_000);
 });
 
