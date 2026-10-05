@@ -1305,26 +1305,28 @@ function sshProcScanChecks(fail: string): string[] {
 // `rid` is set, and never for the scanning shell's own session.
 //
 // scan: runs snap through awk with the recorded sessions in `recs`
-// (` <sid>:<leader start time>` pairs). A recorded session is alive through a
-// process that is not a zombie, has that session id, and started no earlier
-// than the recorded leader, unless the recorded sid now belongs to a process
-// with another start time: Linux reuses a pid only once no session refers to
-// it, so that session has ended. The last line is `scan-ok <saw me> <saw pid
+// (` <sid>:<leader start time>` pairs). Each pair is judged on its own, never
+// by sid alone, since records of different runs can share a sid after pid
+// reuse. A pair (s, t) is alive through a process that is not a zombie, has
+// session id s, and started at or after t, unless the pair has ended by reuse:
+// a process with pid s exists with a start time other than t. Linux reuses a
+// pid only once no session refers to it, so that session has ended. The last
+// line is `scan-ok <saw me> <saw pid
 // 1>`; the result counts only as `scan-ok 1 1`, which shows that awk ran to
 // completion and that the snapshot held this shell (enumeration works) and
 // pid 1 (which every pid namespace has, and which hidepid or a security
 // policy hides from an unprivileged user).
 function sshProcScanFunctions(output: "members" | "live-sessions"): string[] {
   const emit = output === "members"
-    // Every process to stop: alive members of a recorded session, and run-id
+    // Every process to stop: members of an alive recorded pair, and run-id
     // matches.
-    ? "if (sid[i] == mysid || dead(i)) continue; if (live(i) || env[i] == 1) print pid[i]"
-    // Every recorded session that is still alive.
-    : "if (!dead(i) && live(i)) alive[sid[i]] = 1";
+    ? "if (sid[i] == mysid || dead(i)) continue; if (member(i) || env[i] == 1) print pid[i]"
+    // Every recorded pair that is still alive, as `<sid>:<start time>`.
+    : "if (dead(i) || !(sid[i] in bysid)) continue; m = split(bysid[sid[i]], js, \" \"); for (k = 1; k <= m; k++) if (pairlive(js[k], i)) alive[ps[js[k]] \":\" pt[js[k]]] = 1";
   const after = output === "members" ? "" : " for (x in alive) print x;";
   return [
     "snap() { for p in /proc/[0-9]*; do { read -r s < \"$p/stat\"; } 2>/dev/null || continue; r=${s##*\")\"}; set -- $r; e=0; if [ -n \"$rid\" ] && [ \"$4\" != \"$mysid\" ] && [ -O \"$p/environ\" ] && [ -r \"$p/environ\" ] && tr '\\000' '\\n' < \"$p/environ\" 2>/dev/null | grep -qxF \"PAPERCLIP_RUN_ID=$rid\"; then e=1; fi; echo \"${p#/proc/} $1 $4 ${20} $e\"; done; }",
-    `scan() { snap | awk -v recs="$recs" -v me="$me" -v mysid="$mysid" 'function dead(i) { return state[i] == "Z" || state[i] == "X" } function live(i,  s) { s = sid[i]; return (s in st) && !(s in reused) && start[i] + 0 >= st[s] + 0 } BEGIN { n = split(recs, a, " "); for (i = 1; i <= n; i++) { split(a[i], kv, ":"); st[kv[1]] = kv[2] } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; env[NR] = $5; if ($1 == me) seenme = 1; if ($1 == "1") seeninit = 1; if (($1 in st) && $4 != st[$1]) reused[$1] = 1 } END { for (i = 1; i <= NR; i++) { ${emit} }${after} print "scan-ok", seenme + 0, seeninit + 0 }'; }`,
+    `scan() { snap | awk -v recs="$recs" -v me="$me" -v mysid="$mysid" 'function dead(i) { return state[i] == "Z" || state[i] == "X" } function pairlive(j, i) { return !(j in ended) && start[i] + 0 >= pt[j] + 0 } function member(i,  m, k, js) { if (!(sid[i] in bysid)) return 0; m = split(bysid[sid[i]], js, " "); for (k = 1; k <= m; k++) if (pairlive(js[k], i)) return 1; return 0 } BEGIN { n = split(recs, a, " "); for (j = 1; j <= n; j++) { split(a[j], kv, ":"); ps[j] = kv[1]; pt[j] = kv[2]; bysid[kv[1]] = bysid[kv[1]] " " j } } { pid[NR] = $1; state[NR] = $2; sid[NR] = $3; start[NR] = $4; env[NR] = $5; if ($1 == me) seenme = 1; if ($1 == "1") seeninit = 1; if ($1 in bysid) { m = split(bysid[$1], js, " "); for (k = 1; k <= m; k++) if ($4 != pt[js[k]]) ended[js[k]] = 1 } } END { for (i = 1; i <= NR; i++) { ${emit} }${after} print "scan-ok", seenme + 0, seeninit + 0 }'; }`,
     // scanned: runs scan into `out` and returns 1 unless it provably saw
     // every process; `found` holds its result lines.
     "scanned() { out=$(scan); case \"$out\" in *'scan-ok 1 1') ;; *) return 1 ;; esac; found=$(printf '%s\\n' \"$out\" | grep -v '^scan-ok'); return 0; }",
@@ -1338,8 +1340,8 @@ function sshProcScanFunctions(output: "members" | "live-sessions"): string[] {
  * run can also outlive 30 days, and its record is what lets cleanup stop it.
  *
  * - A dir with valid records is pruned only when one /proc scan, passing the
- *   same visibility checks as the stop, shows none of its sessions alive (the
- *   stop's own rule). If the scan can't be trusted, no such dir is pruned.
+ *   same visibility checks as the stop, shows none of its recorded
+ *   (sid, leader start time) pairs alive (the stop's own rule). If the scan can't be trusted, no such dir is pruned.
  * - A dir with an unreadable or malformed record is never pruned.
  * - A dir with no record, only an `untracked` marker or nothing, grants
  *   nothing and is pruned by age alone.
@@ -1373,7 +1375,7 @@ export function buildPruneSshRunSessionRecordsScript(): string {
     "  for f in \"$dir\"/*; do",
     "    [ -f \"$f\" ] || continue",
     "    case \"${f##*/}\" in untracked|*.tmp) continue ;; esac",
-    "    if readrec \"$f\"; then sessions=1; case \"$alive\" in *\" $rsid \"*) keep=1 ;; esac; else keep=1; fi",
+    "    if readrec \"$f\"; then sessions=1; case \"$alive\" in *\" $rsid:$rstart \"*) keep=1 ;; esac; else keep=1; fi",
     "  done",
     "  [ \"$sessions\" = 1 ] && [ \"$canscan\" != 1 ] && keep=1",
     "  [ \"$keep\" = 1 ] || rm -rf \"$dir\"",

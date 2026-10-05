@@ -520,6 +520,33 @@ describeLinux("SSH run session stop (real processes)", () => {
       expect(isRunning(member!)).toBe(true);
     });
 
+    it("judges two records of the same sid separately, whichever is read last", async () => {
+      // After pid reuse, an old run's record and a live run's record can name
+      // the same sid with different leader start times. Only the live pair's
+      // dir survives. The two dirs swap contents between rounds, so each
+      // record is read last in one of them.
+      await makeHome();
+      const leader = spawn("sleep", ["324"], { detached: true, stdio: "ignore" });
+      children.push(leader);
+      await until(() => isRunning(leader.pid!));
+      const liveStart = Number(startTimeOf(leader.pid!));
+      const sidFile = String(leader.pid);
+      const live = `${leader.pid} ${liveStart}\n`;
+      const ended = `${leader.pid} ${liveStart - 1000}\n`;
+      for (const [first, second] of [[live, ended], [ended, live]] as const) {
+        await rm(recordRoot(), { recursive: true, force: true });
+        const dirA = await recordDir("run-a", { [sidFile]: first });
+        const dirB = await recordDir("run-b", { [sidFile]: second });
+
+        const result = await runSh(buildPruneSshRunSessionRecordsScript(), { PATH: process.env.PATH, HOME: home });
+
+        expect(result.code).toBe(0);
+        expect(existsSync(dirA)).toBe(first === live);
+        expect(existsSync(dirB)).toBe(second === live);
+      }
+      expect(isRunning(leader.pid!)).toBe(true);
+    });
+
     it("prunes an old dir whose session ended when no recorded session is alive", async () => {
       await makeHome();
       const dead = await deadSession();
